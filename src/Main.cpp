@@ -59,8 +59,8 @@ bool SaveArchive(struct archive* a)
 	struct archive_entry* entry;
 	while (archive_read_next_header(a, &entry) == ARCHIVE_OK)
 	{
-		const char* name = archive_entry_pathname_utf8(entry);
-		if (StringUtils::ContainsAny(name, "mca", "village", ".dat"))
+		const char* name = archive_entry_pathname(entry);
+		if (StringUtils::ContainsAny(name, ".mca"))
 		{
 			Print::STDOUT << "Found good archive: " << name;
 			Print::STDOUT.Flush();
@@ -69,18 +69,6 @@ bool SaveArchive(struct archive* a)
 
 	}
 	return false;
-}
-
-void ResetArchive(struct archive*& a, ThreadInfo* info)
-{
-	a = archive_read_new();
-	archive_read_support_filter_all(a);
-	archive_read_support_format_zip(a);
-
-	archive_read_set_read_callback(a, MyRead);
-	archive_read_set_close_callback(a, MyClose);
-	archive_read_set_callback_data(a, info);
-
 }
 
 static int copy_data(struct archive *ar, struct archive *aw)
@@ -110,9 +98,6 @@ void ArchiveLoop(ThreadInfo* info)
 	Print::STDOUT << "Thread #" << info->ID << " starting!\nReading from " << info->SectorBegin << " to " << info->SectorEnd;
 	Print::STDOUT.Flush();
 
-	int i = 0;
-	bool newArchive = true;
-	struct archive* a = nullptr;
 	for (std::size_t sector = info->SectorBegin; sector < info->SectorEnd; sector++)
 	{
 		s_ProgressMutex.lock();
@@ -121,16 +106,14 @@ void ArchiveLoop(ThreadInfo* info)
 
 		std::size_t seekPos = sector * info->SectorSize;
 		lseek(info->fd, seekPos, SEEK_SET);
-		if (i % 10000 == 0)
-		{
-//			Print::STDOUT.W(info->ID).W(" at ").W(seekPos).W("\n").Flush();
-		}
-		i++;
 
-		if (newArchive)
-		{
-			ResetArchive(a, info);
-		}
+		struct archive* a = archive_read_new();
+		archive_read_support_filter_all(a);
+		archive_read_support_format_zip(a);
+
+		archive_read_set_read_callback(a, MyRead);
+		archive_read_set_close_callback(a, MyClose);
+		archive_read_set_callback_data(a, info);
 
 		if (archive_read_open1(a) == ARCHIVE_OK)
 		{
@@ -139,8 +122,6 @@ void ArchiveLoop(ThreadInfo* info)
 			{
 				fprintf(stdout, "SAVING ARCHIVE from thread %d\n", info->ID);
 				//Seek back to the same position
-				archive_read_close(a);
-				archive_read_free(a);
 
 				struct archive_entry* entry;
 				int flags = ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM | ARCHIVE_EXTRACT_ACL | ARCHIVE_EXTRACT_FFLAGS;
@@ -150,10 +131,16 @@ void ArchiveLoop(ThreadInfo* info)
 				archive_write_disk_set_standard_lookup(ext);
 
 				lseek(info->fd, seekPos, SEEK_SET);
-				ResetArchive(a, info);
+				struct archive* a2 = archive_read_new();
+				archive_read_support_filter_all(a2);
+				archive_read_support_format_zip(a2);
 
-				int r = archive_read_open1(a);
-				if (r < ARCHIVE_OK) fprintf(stderr, "archive_read_open1 err: %s - #%d\n", archive_error_string(a), info->ID);
+				archive_read_set_read_callback(a2, MyRead);
+				archive_read_set_close_callback(a2, MyClose);
+				archive_read_set_callback_data(a2, info);
+
+				int r = archive_read_open1(a2);
+				if (r < ARCHIVE_OK) fprintf(stderr, "archive_read_open1 err: %s - #%d\n", archive_error_string(a2), info->ID);
 				if (r < ARCHIVE_WARN) exit(1);
 				
 				DefaultFormatter outDir;
@@ -162,9 +149,9 @@ void ArchiveLoop(ThreadInfo* info)
 
 				while (true)
 				{
-					r = archive_read_next_header(a, &entry);
+					r = archive_read_next_header(a2, &entry);
 					if (r == ARCHIVE_EOF) break;
-					if (r < ARCHIVE_OK) fprintf(stdout, "archive_read_next_header err: %s - #%d\n", archive_error_string(a), info->ID);
+					if (r < ARCHIVE_OK) fprintf(stdout, "archive_read_next_header err: %s - #%d\n", archive_error_string(a2), info->ID);
 					if (r < ARCHIVE_WARN) break;
 
 					const char* archivePath = archive_entry_pathname(entry);
@@ -178,7 +165,7 @@ void ArchiveLoop(ThreadInfo* info)
 					else
 					{
 						fprintf(stdout, "extracting %s - #%d\n", archivePath, info->ID);
-						r = copy_data(a, ext);
+						r = copy_data(a2, ext);
 						if (r < ARCHIVE_OK) fprintf(stdout, "copy_data err: %s - #%d\n", archive_error_string(ext), info->ID);
 						if (r < ARCHIVE_WARN) break;
 					}
@@ -191,13 +178,12 @@ void ArchiveLoop(ThreadInfo* info)
 				archive_write_free(ext);
 
 				fprintf(stdout, "\n======================================================================\n\nthread %d finished saving archive\n\n\n\n", info->ID);
+				archive_read_close(a2);
+				archive_read_free(a2);
 			}
-
-			archive_read_close(a);
-			archive_read_free(a);
-
-			newArchive = true;
 		}
+		archive_read_close(a);
+		archive_read_free(a);
 	}
 	Print::STDOUT << "Thread #" << info->ID << " exiting! - read " << ((info->SectorEnd - info->SectorBegin) * info->SectorSize) << " bytes \n";
 	Print::STDOUT.Flush();
@@ -215,13 +201,12 @@ int main()
 {
 	signal(SIGPIPE, sigpipe_handler);
 
-
-	std::size_t length = 50L * 1000 * 1000 * 1000;
+	std::size_t length = 128L * 1000 * 1000 * 1000;
 	std::size_t sectorSize = 4096;
 
-	const char* driveName = "/dev/sdc";
+	const char* driveName = "/dev/sda";
 	int threadCount = System::GetProcessorCount();
-	threadCount = 1;
+	threadCount = 4;
 	Print::STDOUT << "Thread count " << threadCount << "\n";
 	std::size_t sectorsPerThread = length / sectorSize / threadCount;
 	s_Progress.resize(threadCount);
@@ -277,7 +262,7 @@ int main()
 			if (i != threadCount - 1) Print::STDOUT << " | ";
 		}
 		s_ProgressMutex.unlock();
-		Print::STDOUT.W(" === AVERAGE: ").W(totalSpeed / 1000.0 / 1000.0).W("MB/s -").W(-static_cast<double>(total) / length * 100.0).W("%\n").Flush();
+		Print::STDOUT.W(" === AVERAGE: ").W(totalSpeed / 1000.0 / 1000.0).W("MB/s ").W(static_cast<double>(total) / length * 100.0).W("%\n").Flush();
 		std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
 	}
